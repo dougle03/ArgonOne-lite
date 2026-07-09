@@ -4,6 +4,9 @@
 
 It was built as a lightweight alternative to the broader official installer flow. The aim is to keep the install readable, reversible, and easy to audit: one daemon, one config file, one systemd unit, and journal logging.
 
+<img width="1542" height="1134" alt="image" src="https://github.com/user-attachments/assets/95029831-47a2-45ce-8c3e-d1b48ad47171" />
+
+
 Tested hardware and OS:
 
 - Raspberry Pi 4 8GB
