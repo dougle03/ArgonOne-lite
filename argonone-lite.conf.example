@@ -1,0 +1,27 @@
+# argonone-lite example configuration
+
+[daemon]
+poll_seconds = 10
+
+[fan]
+temp_60 = 10
+temp_65 = 50
+temp_72 = 100
+
+[button]
+shutdown_only = true
+
+[mqtt]
+mqtt_enabled = true
+mqtt_host = localhost
+mqtt_port = 1883
+mqtt_topic = moho/argonone/status
+mqtt_client_id = argonone-lite
+mqtt_retain = true
+mqtt_publish_interval_seconds = 30
+mqtt_discovery_enabled = true
+mqtt_discovery_prefix = homeassistant
+mqtt_device_id = moho_argonone
+mqtt_device_name = MoHo Argon ONE
+mqtt_manufacturer = Argon Forty
+mqtt_model = Argon ONE V1

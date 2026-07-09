@@ -1,0 +1,12 @@
+[Unit]
+Description=Minimal Argon ONE V1 fan and power-button daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/argonone-lite
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

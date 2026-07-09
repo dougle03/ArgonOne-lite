@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+
+import configparser
+import json
+import logging
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import gpiod
+from paho.mqtt import client as mqtt
+from smbus2 import SMBus
+
+
+LOG = logging.getLogger("argonone-lite")
+SERVICE_VERSION = "1.2.0"
+CONFIG_PATH = "/etc/argonone-lite.conf"
+I2C_BUS = 1
+I2C_ADDRESS = 0x1A
+BUTTON_GPIO_CHIP = "/dev/gpiochip0"
+BUTTON_GPIO_LINE = 4
+TEMP_PATH = "/sys/class/thermal/thermal_zone0/temp"
+DEFAULT_POLL_SECONDS = 10.0
+DEFAULT_THRESHOLDS = [(72.0, 100), (65.0, 50), (60.0, 10)]
+DEFAULT_MQTT_PUBLISH_INTERVAL_SECONDS = 30.0
+DEFAULT_MQTT_DISCOVERY_PREFIX = "homeassistant"
+DEFAULT_MQTT_DEVICE_ID = "moho_argonone"
+DEFAULT_MQTT_DEVICE_NAME = "MoHo Argon ONE"
+DEFAULT_MQTT_MANUFACTURER = "Argon Forty"
+DEFAULT_MQTT_MODEL = "Argon ONE V1"
+SHUTDOWN_PULSE_MIN_MS = 35
+SHUTDOWN_PULSE_MAX_MS = 80
+REBOOT_PULSE_MIN_MS = 15
+REBOOT_PULSE_MAX_MS = 34
+MQTT_ERROR_LOG_INTERVAL_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class Settings:
+    poll_seconds: float
+    thresholds: list[tuple[float, int]]
+    button_shutdown_only: bool
+    mqtt_enabled: bool
+    mqtt_host: str
+    mqtt_port: int
+    mqtt_topic: str
+    mqtt_client_id: str
+    mqtt_retain: bool
+    mqtt_publish_interval_seconds: float
+    mqtt_discovery_enabled: bool
+    mqtt_discovery_prefix: str
+    mqtt_device_id: str
+    mqtt_device_name: str
+    mqtt_manufacturer: str
+    mqtt_model: str
+
+
+def load_settings(path: str) -> Settings:
+    parser = configparser.ConfigParser()
+    parser.read(path)
+
+    poll_seconds = max(1.0, parser.getfloat("daemon", "poll_seconds", fallback=DEFAULT_POLL_SECONDS))
+    button_shutdown_only = parser.getboolean("button", "shutdown_only", fallback=True)
+
+    mqtt_enabled = parser.getboolean("mqtt", "mqtt_enabled", fallback=True)
+    mqtt_host = parser.get("mqtt", "mqtt_host", fallback="localhost").strip() or "localhost"
+    mqtt_port = parser.getint("mqtt", "mqtt_port", fallback=1883)
+    mqtt_topic = parser.get("mqtt", "mqtt_topic", fallback="moho/argonone/status").strip() or "moho/argonone/status"
+    mqtt_client_id = parser.get("mqtt", "mqtt_client_id", fallback="argonone-lite").strip() or "argonone-lite"
+    mqtt_retain = parser.getboolean("mqtt", "mqtt_retain", fallback=True)
+    mqtt_publish_interval_seconds = max(
+        5.0,
+        parser.getfloat(
+            "mqtt",
+            "mqtt_publish_interval_seconds",
+            fallback=DEFAULT_MQTT_PUBLISH_INTERVAL_SECONDS,
+        ),
+    )
+    mqtt_discovery_enabled = parser.getboolean("mqtt", "mqtt_discovery_enabled", fallback=True)
+    mqtt_discovery_prefix = (
+        parser.get("mqtt", "mqtt_discovery_prefix", fallback=DEFAULT_MQTT_DISCOVERY_PREFIX).strip()
+        or DEFAULT_MQTT_DISCOVERY_PREFIX
+    )
+    mqtt_device_id = (
+        parser.get("mqtt", "mqtt_device_id", fallback=DEFAULT_MQTT_DEVICE_ID).strip()
+        or DEFAULT_MQTT_DEVICE_ID
+    )
+    mqtt_device_name = (
+        parser.get("mqtt", "mqtt_device_name", fallback=DEFAULT_MQTT_DEVICE_NAME).strip()
+        or DEFAULT_MQTT_DEVICE_NAME
+    )
+    mqtt_manufacturer = (
+        parser.get("mqtt", "mqtt_manufacturer", fallback=DEFAULT_MQTT_MANUFACTURER).strip()
+        or DEFAULT_MQTT_MANUFACTURER
+    )
+    mqtt_model = (
+        parser.get("mqtt", "mqtt_model", fallback=DEFAULT_MQTT_MODEL).strip()
+        or DEFAULT_MQTT_MODEL
+    )
+
+    entries: list[tuple[float, int]] = []
+    if parser.has_section("fan"):
+        for key, value in parser.items("fan"):
+            if not key.startswith("temp_"):
+                continue
+            try:
+                threshold = float(key.removeprefix("temp_").replace("_", "."))
+                speed = max(0, min(100, int(value)))
+            except ValueError:
+                continue
+            entries.append((threshold, speed))
+
+    if not entries:
+        entries = list(DEFAULT_THRESHOLDS)
+    entries.sort()
+
+    return Settings(
+        poll_seconds=poll_seconds,
+        thresholds=entries,
+        button_shutdown_only=button_shutdown_only,
+        mqtt_enabled=mqtt_enabled,
+        mqtt_host=mqtt_host,
+        mqtt_port=mqtt_port,
+        mqtt_topic=mqtt_topic,
+        mqtt_client_id=mqtt_client_id,
+        mqtt_retain=mqtt_retain,
+        mqtt_publish_interval_seconds=mqtt_publish_interval_seconds,
+        mqtt_discovery_enabled=mqtt_discovery_enabled,
+        mqtt_discovery_prefix=mqtt_discovery_prefix,
+        mqtt_device_id=mqtt_device_id,
+        mqtt_device_name=mqtt_device_name,
+        mqtt_manufacturer=mqtt_manufacturer,
+        mqtt_model=mqtt_model,
+    )
+
+
+def read_cpu_temp_c() -> float:
+    with open(TEMP_PATH, "r", encoding="ascii") as handle:
+        return int(handle.read().strip()) / 1000.0
+
+
+def speed_for_temp(temp_c: float, thresholds: list[tuple[float, int]]) -> int:
+    target = 0
+    for threshold, speed in thresholds:
+        if temp_c >= threshold:
+            target = speed
+    return target
+
+
+def next_fan_threshold(temp_c: float, thresholds: list[tuple[float, int]], current_speed: int) -> float | None:
+    for threshold, speed in thresholds:
+        if threshold > temp_c and speed != current_speed:
+            return threshold
+    return None
+
+
+class ArgonFanController:
+    def __init__(self, bus_number: int, address: int) -> None:
+        self._address = address
+        self._bus = SMBus(bus_number)
+        self._last_speed: int | None = None
+
+    @property
+    def last_speed(self) -> int | None:
+        return self._last_speed
+
+    def set_speed(self, percent: int) -> None:
+        percent = max(0, min(100, int(percent)))
+        if self._last_speed == percent:
+            return
+        self._bus.write_byte(self._address, percent)
+        self._last_speed = percent
+        LOG.info("fan speed set to %s%%", percent)
+
+    def close(self) -> None:
+        self._bus.close()
+
+
+class MqttManager:
+    def __init__(self, settings: Settings, hostname: str, button_monitor_state: str) -> None:
+        self._settings = settings
+        self._hostname = hostname
+        self._button_monitor_state = button_monitor_state
+        self._started_monotonic = time.monotonic()
+        self._last_publish_monotonic = 0.0
+        self._last_error_log_monotonic = 0.0
+        self._latest_status_payload: str | None = None
+        self._latest_status_values: dict[str, object] | None = None
+        self._client: mqtt.Client | None = None
+        self._connected = False
+        self._lock = threading.Lock()
+
+    @property
+    def discovery_topic(self) -> str:
+        return f"{self._settings.mqtt_discovery_prefix}/device/{self._settings.mqtt_device_id}/config"
+
+    def _log_mqtt_error(self, message: str, exc: Exception | None = None) -> None:
+        now = time.monotonic()
+        if (now - self._last_error_log_monotonic) < MQTT_ERROR_LOG_INTERVAL_SECONDS:
+            return
+        self._last_error_log_monotonic = now
+        if exc is None:
+            LOG.warning(message)
+        else:
+            LOG.warning("%s: %s", message, exc)
+
+    def start(self) -> None:
+        if not self._settings.mqtt_enabled:
+            return
+        try:
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self._settings.mqtt_client_id)
+            client.on_connect = self._on_connect
+            client.on_disconnect = self._on_disconnect
+            client.on_message = self._on_message
+            client.reconnect_delay_set(min_delay=1, max_delay=30)
+            client.connect_async(self._settings.mqtt_host, self._settings.mqtt_port, keepalive=60)
+            client.loop_start()
+            self._client = client
+        except Exception as exc:
+            self._log_mqtt_error("failed to initialize mqtt client", exc)
+
+    def stop(self) -> None:
+        client = self._client
+        if client is None:
+            return
+        try:
+            client.loop_stop()
+            client.disconnect()
+        except Exception as exc:
+            self._log_mqtt_error("failed to stop mqtt client cleanly", exc)
+
+    def build_status_values(
+        self,
+        temperature_c: float,
+        fan_percent: int,
+        fan_target_temperature_c: float | None,
+    ) -> dict[str, object]:
+        return {
+            "temperature_c": round(temperature_c, 2),
+            "fan_percent": fan_percent,
+            "fan_state": "on" if fan_percent > 0 else "off",
+            "fan_target_temperature_c": None if fan_target_temperature_c is None else round(fan_target_temperature_c, 2),
+            "uptime_seconds": int(time.monotonic() - self._started_monotonic),
+            "service_version": SERVICE_VERSION,
+            "hostname": self._hostname,
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "button_monitor": self._button_monitor_state,
+            "mqtt_discovery_enabled": self._settings.mqtt_discovery_enabled,
+            "mqtt_discovery_prefix": self._settings.mqtt_discovery_prefix,
+        }
+
+    def publish_status_if_needed(
+        self,
+        temperature_c: float,
+        fan_percent: int,
+        fan_target_temperature_c: float | None,
+        force: bool = False,
+    ) -> None:
+        if not self._settings.mqtt_enabled:
+            return
+
+        now = time.monotonic()
+        if not force and (now - self._last_publish_monotonic) < self._settings.mqtt_publish_interval_seconds:
+            return
+
+        values = self.build_status_values(temperature_c, fan_percent, fan_target_temperature_c)
+        payload = json.dumps(values, separators=(",", ":"))
+
+        with self._lock:
+            self._latest_status_values = values
+            self._latest_status_payload = payload
+
+        self._publish(self._settings.mqtt_topic, payload, self._settings.mqtt_retain)
+        self._last_publish_monotonic = now
+        LOG.info("published mqtt status to %s", self._settings.mqtt_topic)
+
+    def _publish(self, topic: str, payload: str, retain: bool) -> None:
+        client = self._client
+        if client is None:
+            return
+        try:
+            info = client.publish(topic, payload=payload, qos=0, retain=retain)
+            if info.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"publish rc={info.rc}")
+        except Exception as exc:
+            self._log_mqtt_error(f"mqtt publish failed for {topic}", exc)
+
+    def _publish_discovery(self) -> None:
+        if not (self._settings.mqtt_enabled and self._settings.mqtt_discovery_enabled):
+            return
+
+        payload = {
+            "dev": {
+                "ids": [self._settings.mqtt_device_id],
+                "name": self._settings.mqtt_device_name,
+                "mf": self._settings.mqtt_manufacturer,
+                "mdl": self._settings.mqtt_model,
+                "sw": SERVICE_VERSION,
+                "sa": "Server Room",
+            },
+            "o": {
+                "name": "argonone-lite",
+                "sw": SERVICE_VERSION,
+            },
+            "state_topic": self._settings.mqtt_topic,
+            "qos": 0,
+            "cmps": {
+                "cpu_temperature": {
+                    "p": "sensor",
+                    "name": "CPU Temperature",
+                    "unique_id": f"{self._settings.mqtt_device_id}_cpu_temperature",
+                    "default_entity_id": "sensor.moho_argon_one_cpu_temperature",
+                    "device_class": "temperature",
+                    "state_class": "measurement",
+                    "unit_of_measurement": "°C",
+                    "suggested_display_precision": 2,
+                    "value_template": "{{ value_json.temperature_c }}",
+                },
+                "fan_speed": {
+                    "p": "sensor",
+                    "name": "Fan Speed",
+                    "unique_id": f"{self._settings.mqtt_device_id}_fan_speed",
+                    "default_entity_id": "sensor.moho_argon_one_fan_speed",
+                    "state_class": "measurement",
+                    "unit_of_measurement": "%",
+                    "icon": "mdi:fan",
+                    "value_template": "{{ value_json.fan_percent }}",
+                },
+                "next_fan_threshold": {
+                    "p": "sensor",
+                    "name": "Next Fan Threshold",
+                    "unique_id": f"{self._settings.mqtt_device_id}_next_fan_threshold",
+                    "default_entity_id": "sensor.moho_argon_one_next_fan_threshold",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°C",
+                    "suggested_display_precision": 1,
+                    "icon": "mdi:thermometer-chevron-up",
+                    "value_template": "{{ value_json.fan_target_temperature_c }}",
+                },
+                "daemon_uptime": {
+                    "p": "sensor",
+                    "name": "Daemon Uptime",
+                    "unique_id": f"{self._settings.mqtt_device_id}_daemon_uptime",
+                    "default_entity_id": "sensor.moho_argon_one_daemon_uptime",
+                    "unit_of_measurement": "s",
+                    "state_class": "measurement",
+                    "entity_category": "diagnostic",
+                    "icon": "mdi:timer-outline",
+                    "value_template": "{{ value_json.uptime_seconds }}",
+                },
+                "service_version": {
+                    "p": "sensor",
+                    "name": "Service Version",
+                    "unique_id": f"{self._settings.mqtt_device_id}_service_version",
+                    "default_entity_id": "sensor.moho_argon_one_service_version",
+                    "entity_category": "diagnostic",
+                    "icon": "mdi:information-outline",
+                    "value_template": "{{ value_json.service_version }}",
+                },
+                "fan_state": {
+                    "p": "sensor",
+                    "name": "Fan State",
+                    "unique_id": f"{self._settings.mqtt_device_id}_fan_state",
+                    "default_entity_id": "sensor.moho_argon_one_fan_state",
+                    "entity_category": "diagnostic",
+                    "icon": "mdi:fan-alert",
+                    "value_template": "{{ value_json.fan_state }}",
+                },
+                "button_monitor": {
+                    "p": "sensor",
+                    "name": "Button Monitor",
+                    "unique_id": f"{self._settings.mqtt_device_id}_button_monitor",
+                    "default_entity_id": "sensor.moho_argon_one_button_monitor",
+                    "entity_category": "diagnostic",
+                    "icon": "mdi:gesture-tap-button",
+                    "value_template": "{{ value_json.button_monitor }}",
+                },
+            },
+        }
+        self._publish(self.discovery_topic, json.dumps(payload, separators=(",", ":")), retain=True)
+        LOG.info("published mqtt discovery to %s", self.discovery_topic)
+
+    def _republish_status(self) -> None:
+        if not self._settings.mqtt_enabled:
+            return
+        with self._lock:
+            payload = self._latest_status_payload
+        if payload is not None:
+            self._publish(self._settings.mqtt_topic, payload, self._settings.mqtt_retain)
+            LOG.info("republished mqtt status to %s", self._settings.mqtt_topic)
+
+    def _on_connect(self, client: mqtt.Client, _userdata, _flags, reason_code, _properties) -> None:
+        self._connected = True
+        LOG.info("mqtt connected to %s:%s with reason_code=%s", self._settings.mqtt_host, self._settings.mqtt_port, reason_code)
+        if self._settings.mqtt_discovery_enabled:
+            client.subscribe(f"{self._settings.mqtt_discovery_prefix}/status", qos=0)
+            self._publish_discovery()
+        self._republish_status()
+
+    def _on_disconnect(self, _client: mqtt.Client, _userdata, _disconnect_flags, reason_code, _properties) -> None:
+        self._connected = False
+        self._log_mqtt_error(f"mqtt disconnected from {self._settings.mqtt_host}:{self._settings.mqtt_port} rc={reason_code}")
+
+    def _on_message(self, _client: mqtt.Client, _userdata, msg: mqtt.MQTTMessage) -> None:
+        if msg.topic != f"{self._settings.mqtt_discovery_prefix}/status":
+            return
+        payload = msg.payload.decode("utf-8", errors="ignore").strip().lower()
+        if payload == "online":
+            LOG.info("received home assistant mqtt birth on %s", msg.topic)
+            self._publish_discovery()
+            self._republish_status()
+
+
+class ButtonMonitor(threading.Thread):
+    def __init__(self, stop_event: threading.Event, shutdown_only: bool) -> None:
+        super().__init__(name="button-monitor", daemon=True)
+        self._stop_event = stop_event
+        self._shutdown_only = shutdown_only
+
+    def _request_system_action(self, action: str) -> None:
+        LOG.warning("button requested %s", action)
+        if action == "shutdown":
+            subprocess.run(["systemctl", "poweroff"], check=False)
+        elif action == "reboot":
+            subprocess.run(["systemctl", "reboot"], check=False)
+
+    def run(self) -> None:
+        try:
+            config = {
+                BUTTON_GPIO_LINE: gpiod.LineSettings(
+                    direction=gpiod.line.Direction.INPUT,
+                    edge_detection=gpiod.line.Edge.BOTH,
+                    bias=gpiod.line.Bias.PULL_UP,
+                )
+            }
+            with gpiod.request_lines(BUTTON_GPIO_CHIP, consumer="argonone-lite", config=config) as request:
+                LOG.info("monitoring front button on %s line %s", BUTTON_GPIO_CHIP, BUTTON_GPIO_LINE)
+                while not self._stop_event.is_set():
+                    events = request.read_edge_events(max_events=1)
+                    for event in events:
+                        if event.event_type != event.Type.RISING_EDGE:
+                            continue
+                        started = time.monotonic()
+                        while request.get_value(BUTTON_GPIO_LINE) == gpiod.line.Value.ACTIVE:
+                            if self._stop_event.wait(0.005):
+                                return
+                        pulse_ms = (time.monotonic() - started) * 1000.0
+                        if SHUTDOWN_PULSE_MIN_MS <= pulse_ms <= SHUTDOWN_PULSE_MAX_MS:
+                            self._request_system_action("shutdown")
+                            return
+                        if REBOOT_PULSE_MIN_MS <= pulse_ms <= REBOOT_PULSE_MAX_MS:
+                            if self._shutdown_only:
+                                LOG.info("ignored reboot-style pulse %.1fms because shutdown_only=true", pulse_ms)
+                            else:
+                                self._request_system_action("reboot")
+                                return
+                        else:
+                            LOG.info("ignored unknown button pulse %.1fms", pulse_ms)
+        except Exception:
+            LOG.exception("button monitor failed")
+
+
+def install_signal_handlers(stop_event: threading.Event) -> None:
+    def _handle(_signum, _frame) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    if os.geteuid() != 0:
+        LOG.error("must run as root")
+        return 1
+
+    settings = load_settings(CONFIG_PATH)
+    LOG.info(
+        "starting version=%s poll_seconds=%s thresholds=%s shutdown_only=%s mqtt_enabled=%s mqtt_host=%s mqtt_port=%s mqtt_topic=%s mqtt_interval=%s mqtt_discovery_enabled=%s mqtt_discovery_prefix=%s mqtt_device_id=%s",
+        SERVICE_VERSION,
+        settings.poll_seconds,
+        settings.thresholds,
+        settings.button_shutdown_only,
+        settings.mqtt_enabled,
+        settings.mqtt_host,
+        settings.mqtt_port,
+        settings.mqtt_topic,
+        settings.mqtt_publish_interval_seconds,
+        settings.mqtt_discovery_enabled,
+        settings.mqtt_discovery_prefix,
+        settings.mqtt_device_id,
+    )
+
+    stop_event = threading.Event()
+    install_signal_handlers(stop_event)
+    hostname = socket.gethostname()
+    button_monitor_state = "shutdown-only" if settings.button_shutdown_only else "shutdown-and-reboot"
+
+    try:
+        fan = ArgonFanController(I2C_BUS, I2C_ADDRESS)
+    except Exception:
+        LOG.exception("failed to open i2c bus %s address 0x%02x", I2C_BUS, I2C_ADDRESS)
+        return 1
+
+    button_monitor = ButtonMonitor(stop_event, settings.button_shutdown_only)
+    button_monitor.start()
+
+    mqtt_manager = MqttManager(settings, hostname, button_monitor_state)
+    mqtt_manager.start()
+
+    try:
+        while not stop_event.is_set():
+            try:
+                temp_c = read_cpu_temp_c()
+                target_speed = speed_for_temp(temp_c, settings.thresholds)
+                next_threshold = next_fan_threshold(temp_c, settings.thresholds, target_speed)
+                LOG.info("cpu temp %.2fC -> target fan %s%% next threshold=%s", temp_c, target_speed, next_threshold)
+                speed_changed = fan.last_speed != target_speed
+                fan.set_speed(target_speed)
+                mqtt_manager.publish_status_if_needed(temp_c, target_speed, next_threshold, force=speed_changed)
+            except Exception:
+                LOG.exception("poll cycle failed")
+            stop_event.wait(settings.poll_seconds)
+    finally:
+        try:
+            fan.set_speed(0)
+        except Exception:
+            LOG.exception("failed to set fan to 0 on exit")
+        fan.close()
+        mqtt_manager.stop()
+
+    LOG.info("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
