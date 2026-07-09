@@ -45,7 +45,7 @@ If `/etc/argonone-lite.conf` already exists and you want to keep local settings,
 Review:
 
 ```bash
-sudoedit /etc/argonone-lite.conf
+sudo nano /etc/argonone-lite.conf
 ```
 
 Common settings:
@@ -74,7 +74,7 @@ sudo journalctl -u argonone-lite.service -n 100 --no-pager
 If `mqtt_discovery_enabled = true`, the daemon publishes retained discovery to:
 
 ```text
-homeassistant/device/moho_argonone/config
+homeassistant/device/argonone/config
 ```
 
 Default Home Assistant MQTT integration discovery prefix should remain:
