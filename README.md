@@ -6,6 +6,12 @@ It was built as a lightweight alternative to the broader official installer flow
 
 <img width="1542" height="1134" alt="image" src="https://github.com/user-attachments/assets/95029831-47a2-45ce-8c3e-d1b48ad47171" />
 
+Independent implementation rather than wrapping the vendor installer.
+Minimal attack surface—one daemon, one config, one service.
+No dependency on Argon's download server after installation.
+Home Assistant native integration via MQTT Discovery.
+Systemd-native with journald logging.
+Documented and versioned from day one.
 
 Tested hardware and OS:
 
